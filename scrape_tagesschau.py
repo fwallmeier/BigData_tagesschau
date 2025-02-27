@@ -224,9 +224,10 @@ if __name__ == "__main__":
             all_df.append(get_articles(date))
         except:
             print(f"Error on date {date}")
-        # save every 100 days
-        if i % 100 == 0:
+        # save every 50 days
+        if i % 20 == 0:
             save(pd.concat(all_df), args.output)
+            print(f"Saved {i} days")
 
     save(pd.concat(all_df), args.output)
     print(f"Done - saved to {args.output}")

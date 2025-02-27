@@ -56,5 +56,5 @@ pip install beautifulsoup4 pandas tqdm
 Run with:
 
 ```bash
-python scrape_tagesschau.py #--start_date=2018-01-01 --end_date=2023-01-01 --output=tagesschau.csv
+python scrape_tagesschau.py #--start_date=2018-01-01 --end_date=2023-01-01 --output=tagesschau_240121.csv
 ```
