@@ -1,233 +1,256 @@
-import bs4 as bs
+#!/usr/bin/env python3
+import asyncio
+import aiohttp
+import bs4
 import urllib.request
-import pandas as pd
-from multiprocessing import Pool
-import json
 import datetime
+import json
 import argparse
+import pandas as pd
 from tqdm import tqdm
+import os
 
 
-def get_article_bodies_multiprocessing(links):
-    with Pool(8) as p:
-        return p.map(get_article_body, links)
-
-
-def get_article_body(href):
-    """Get the article body from the href of the article. The HTML contains a script tag with the article body in JSON format.
-
-    Arguments: 
-        href {str} -- The href of the article
-
-    Returns:
-        str -- The article body"""
-    try:
-        url = "https://www.tagesschau.de" + href
-        sauce = urllib.request.urlopen(url).read()
-        soup = bs.BeautifulSoup(sauce, features="html.parser")
-        scripts = soup.findAll('script', attrs={'type': 'application/ld+json'})
-        for script in scripts:
-            data = json.loads(script.text)
-            if data["@type"] == "NewsArticle":
-                return data["articleBody"]
-        return None
-    except:
-        return None
-
-
-def filter_all(headlines, short_headlines, short_text, links):
-    """Filter out all articles that are not from the tagesschau.de domain.
-
-    Arguments:
-        headlines {list} -- List of headlines
-        short_headlines {list} -- List of short headlines
-        short_text {list} -- List of short texts
-        links {list} -- List of links
-
-    Returns:
-        list -- List of filtered headlines
-        list -- List of filtered short headlines
-        list -- List of filtered short texts
-        list -- List of filtered links
+def load_content(date, page=1):
     """
-    indices = [i for i, x in enumerate(links) if x.startswith("/")]
-    headlines = [headlines[i] for i in indices]
-    short_headlines = [short_headlines[i] for i in indices]
-    short_text = [short_text[i] for i in indices]
-    links = [links[i] for i in indices]
-    return headlines, short_headlines, short_text, links
-
-
-def load_content(date):
-    """Load the content of the tagesschau.de archive for a given date.
-
-    Arguments:
-        date {str} -- The date in the format YYYY-MM-DD
-
-    Returns:
-        list -- List of children of the content div
+    Lädt den HTML-Inhalt der Tagesschau-Archivseite für ein gegebenes Datum und pageIndex.
     """
-    # url format url + ?datum=2018-07-01
-    url = "https://www.tagesschau.de/archiv?datum=" + date
-    sauce = urllib.request.urlopen(url).read()
-    soup = bs.BeautifulSoup(sauce, features="html.parser")
-    content = soup.find('div', attrs={'id': 'content'})
-    return content.findChildren(
-        "div", 
-        attrs={'class': 'copytext-element-wrapper__vertical-only'}
-    )
+    url = f"https://www.tagesschau.de/archiv?datum={date}&pageIndex={page}"
+    response = urllib.request.urlopen(url).read()
+    soup = bs4.BeautifulSoup(response, features="html.parser")
+    return soup
 
 
-def find_for_all(children, attr, value):
-    """Find the value of an attribute for all children of a given list of children.
-
-    Arguments:
-        children {list} -- List of children
-        attr {str} -- The attribute to find
-        value {str} -- The value of the attribute
-
-    Returns:
-        list -- List of values
+def get_links_from_page(date, page):
     """
-    out = []
+    Ruft die Artikel-Metadaten (u.a. Link, Headline, Kurztext) von der Archivseite ab.
+    Dabei wird geprüft, ob es sich um eine Monatsübersicht handelt (z. B. "Dezember 2022")
+    statt um einen Tag (z. B. "01. Dezember 2024").
+
+    Rückgabe:
+      - Eine Liste von Dictionaries mit den extrahierten Metadaten
+      - Ein Flag (monthly_summary), das angibt, ob es sich um eine Monatsübersicht handelt.
+    """
+    soup = load_content(date, page)
+
+    # Prüfen, ob das Element archive__headline vorhanden ist und ob es eine Monatsübersicht signalisiert.
+    monthly_summary = False
+    headline_elem = soup.find(class_="archive__headline")
+    if headline_elem:
+        headline_text = headline_elem.get_text(strip=True)
+        if headline_text and not headline_text[0].isdigit():
+            monthly_summary = True
+
+    content_div = soup.find('div', id='content')
+    if not content_div:
+        return [], monthly_summary
+    children = content_div.find_all("div", class_="copytext-element-wrapper__vertical-only")
+    if not children:
+        return [], monthly_summary
+
+    links = []
+    # Wie im Originalcode werden ab dem dritten Element die eigentlichen Artikelinfos erwartet.
     for child in children[2:]:
-        val = child.find(attr, attrs={'class': value})
-        if val is not None:
-            if attr == "a":
-                out.append(val['href'])
-            else:
-                out.append(val.text)
-        else:
-            out.append("")
-    return out
+        a_elem = child.find("a", class_="teaser-right__link")
+        link = a_elem['href'] if a_elem and a_elem.has_attr('href') else ""
+        headline_elem = child.find("span", class_="teaser-right__headline")
+        headline = headline_elem.get_text(strip=True) if headline_elem else ""
+        short_headline_elem = child.find("span", class_="teaser-right__labeltopline")
+        short_headline = short_headline_elem.get_text(strip=True) if short_headline_elem else ""
+        short_text_elem = child.find("p", class_="teaser-right__shorttext")
+        short_text = short_text_elem.get_text(strip=True) if short_text_elem else ""
+        date_elem = child.find("div", class_="teaser-right__date")
+        date_api = date_elem.get_text(strip=True) if date_elem else None
+        links.append({
+            "date": date_api if date_api else date,
+            "headline": headline,
+            "short_headline": short_headline,
+            "short_text": short_text,
+            "link": link
+        })
+    return links, monthly_summary
 
 
-def get_metadata(children):
-    """Get the metadata of the articles from the children of the content div.
+import concurrent.futures
 
-    Arguments:
-        children {list} -- List of children of the content div
+def collect_links(start_date, end_date, links_filename):
 
-    Returns:
-        list -- List of headlines
-        list -- List of short headlines
-        list -- List of short texts
-        list -- List of links
     """
-    headlines = find_for_all(children, "span", "teaser-right__headline")
-    short_headlines = find_for_all(children, "span", "teaser-right__labeltopline")
-    short_text = find_for_all(children, "p", "teaser-right__shorttext")
-    links = find_for_all(children, "a", "teaser-right__link")
-    return headlines, short_headlines, short_text, links
-
-
-def get_articles(date):
-    """Get all articles from a given date.
-
-    Arguments:
-        date {str} -- The date in the format YYYY-MM-DD
-
-    Returns:
-        pd.DataFrame -- DataFrame with the columns date, headline, short_headline, short_text, article, link
+    Sammelt für alle Tage im angegebenen Zeitraum die verfügbaren Artikel-Links.
+    Parallelisiert das Abrufen der Seiteninhalte für eine schnellere Verarbeitung.
     """
-    children = load_content(date)
-    content = get_metadata(children)
-    headlines, short_headlines, short_text, links = filter_all(*content)
-    articles = get_article_bodies_multiprocessing(links)
-    df = pd.DataFrame({
-        'date': [date]*len(headlines), 
-        'headline': headlines,
-        'short_headline': short_headlines, 
-        'short_text': short_text, 
-        'article': articles, 
-        'link': links})
-    return df
+    processed_months = set()  # Set (Jahr, Monat), um doppelte Monatsübersichten zu vermeiden
+    all_links = []
+    current_date = start_date
+    total_days = (end_date - start_date).days + 1
+    error_file = "error_day.json"
+
+    with tqdm(total=total_days, desc="Verarbeite Tage", unit="Tag") as pbar, concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {}
+
+        while current_date <= end_date:
+            date_str = current_date.strftime("%Y-%m-%d")
+            year_month = (current_date.year, current_date.month)
+
+            if year_month in processed_months:
+                current_date += datetime.timedelta(days=1)
+                pbar.update(1)
+                continue
+
+            futures[executor.submit(get_links_from_page, date_str, 1)] = (date_str, 1, year_month)
+            current_date += datetime.timedelta(days=1)
+
+        for future in concurrent.futures.as_completed(futures):
+            date_str, page, year_month = futures[future]
+            try:
+                links, monthly_summary = future.result()
+                if links:
+                    all_links.extend(links)
+                    with open(links_filename, "a", encoding="utf-8") as f:
+                        for entry in links:
+                            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                if monthly_summary:
+                    processed_months.add(year_month)
+            except Exception as e:
+                error_data = {"date": date_str, "page": page, "error": str(e)}
+                print(f"Fehler beim Verarbeiten von {date_str} Seite {page}: {e}")
+
+                # Fehler in JSON-Datei speichern
+                if os.path.exists(error_file):
+                    with open(error_file, "r+", encoding="utf-8") as f:
+                        try:
+                            errors = json.load(f)
+                        except json.JSONDecodeError:
+                            errors = []
+                        errors.append(error_data)
+                        f.seek(0)
+                        json.dump(errors, f, ensure_ascii=False, indent=2)
+                else:
+                    with open(error_file, "w", encoding="utf-8") as f:
+                        json.dump([error_data], f, ensure_ascii=False, indent=2)
+
+        pbar.update(1)
+
+    return all_links
 
 
-def generate_dates(start_date=datetime.date(2018, 1, 1), end_date=datetime.date.today()):
-    """Generate a reverse chronological list of dates in the format YYYY-MM-DD.
-
-    Keyword Arguments:
-        start_date {datetime.date} -- The start date (default: {datetime.date(2018, 1, 1)})
-        end_date {datetime.date} -- The end date (default: {datetime.date.today()})
-
-    Yields:
-        str -- The date in the format YYYY-MM-DD
+async def fetch_article(session, entry):
     """
-    day = end_date
-    delta = datetime.timedelta(days=1)
-    while day >= start_date:
-        yield day.strftime("%Y-%m-%d")
-        day -= delta
-
-
-def n_days_between(start_date, end_date):
-    """Calculate the number of days between two dates.
-
-    Arguments:
-        start_date {datetime.date} -- The start date
-        end_date {datetime.date} -- The end date
-
-    Returns:
-        int -- The number of days
+    Lädt asynchron den Artikel zu einem übergebenen Link und extrahiert erweiterte Metadaten,
+    einschließlich der Taglist (keywords).
     """
-    return (end_date - start_date).days + 1
+    url = "https://www.tagesschau.de" + entry["link"]
+    try:
+        async with session.get(url) as response:
+            text = await response.text()
+            soup = bs4.BeautifulSoup(text, features="html.parser")
+            scripts = soup.find_all("script", type="application/ld+json")
+
+            label_elem = soup.find("span", class_="label label--standard-primary")
+            entry["label"] = label_elem.get_text(strip=True) if label_elem else ""
+
+            for script in scripts:
+                try:
+                    data = json.loads(script.string)
+                    if isinstance(data, list):
+                        for item in data:
+                            if item.get("@type") == "NewsArticle":
+                                entry["articleBody"] = item.get("articleBody", "")
+                                entry["datePublished"] = item.get("datePublished", "")
+                                entry["author"] = item.get("author", "")
+                                entry["description"] = item.get("description", "")
+                                entry["taglist"] = item.get("keywords", [])  # Hier wird die Taglist gespeichert
+                                break
+                    elif data.get("@type") == "NewsArticle":
+                        entry["articleBody"] = data.get("articleBody", "")
+                        entry["datePublished"] = data.get("datePublished", "")
+                        entry["author"] = data.get("author", "")
+                        entry["description"] = data.get("description", "")
+                        entry["taglist"] = data.get("keywords", [])  # Falls `keywords` existiert, speichern
+                        break
+                except Exception:
+                    continue
+            return entry
+    except Exception as e:
+        print(f"Error fetching article {url}: {e}")
+        entry["taglist"] = []
+        entry["taglist"] = []
+        return entry
 
 
-def save(df, filename):
-    """Save the DataFrame to a pickle or csv file.
 
-    Arguments:
-        df {pd.DataFrame} -- The DataFrame
-        filename {str} -- The filename
+async def fetch_all_articles(entries, concurrency=10):
     """
-    if filename.endswith(".pkl"):
-        df.to_pickle(filename)
-    elif filename.endswith(".csv"):
-        df.to_csv(filename, sep="\t", index=False)
+    Führt den asynchronen Abruf aller Artikel-Bodies mit einer maximalen Parallelität (concurrency) durch.
+    """
+    results = []
+    connector = aiohttp.TCPConnector(limit=concurrency)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [fetch_article(session, entry) for entry in entries]
+        for future in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Fetching articles"):
+            result = await future
+            results.append(result)
+    return results
+
+
+def load_links(links_filename):
+    """
+    Lädt die bereits gespeicherten Links (und zugehörige Metadaten) aus der links-Datei.
+    """
+    entries = []
+    if os.path.exists(links_filename):
+        with open(links_filename, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                    if not entry["link"].startswith("http"):
+                        entries.append(entry)
+                except:
+                    continue
+
+    return entries
+
+
+def save_articles(articles, output_filename):
+    """
+    Speichert die Artikel inklusive aller Metadaten als CSV (oder alternativ als Pickle).
+    """
+    df = pd.DataFrame(articles)
+    if output_filename.endswith(".csv"):
+        df.to_csv(output_filename, sep="\t", index=False)
     else:
-        df.to_pickle(filename + ".pkl")
-        raise ValueError("Unknown file format, saved as pickle file.")
+        df.to_pickle(output_filename)
+        print("Saved as pickle file.")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description='Scrape the tagesschau.de archive.'
-    )
-    parser.add_argument(
-        '--start_date', 
-        type=str, 
-        default="2018-01-01",
-        help='The start date in the format YYYY-MM-DD'
-    )
-    parser.add_argument(
-        '--end_date', 
-        type=str, 
-        default=datetime.date.today().strftime("%Y-%m-%d"),
-        help='The end date in the format YYYY-MM-DD'
-    )
-    parser.add_argument(
-        '--output', 
-        type=str,
-        default="tagesschau.csv", 
-        help='The output file'
-    )
+def main():
+    parser = argparse.ArgumentParser(description="Tagesschau Archiv Scraper")
+    parser.add_argument("--mode", type=str, choices=["collect", "fetch"], required=True,
+                        help="Modus: 'collect' sammelt Links, 'fetch' lädt Artikel-Bodies")
+    parser.add_argument("--start_date", type=str, default="2023-10-01", help="Startdatum im Format YYYY-MM-DD")
+    parser.add_argument("--end_date", type=str, default=datetime.date.today().strftime("%Y-%m-%d"),
+                        help="Enddatum im Format YYYY-MM-DD")
+    parser.add_argument("--links_file", type=str, default="links.json",
+                        help="Datei zum Speichern der gesammelten Links")
+    parser.add_argument("--output", type=str, default="tagesschau_articles.csv", help="Ausgabedatei für Artikel")
     args = parser.parse_args()
+
     start_date = datetime.datetime.strptime(args.start_date, "%Y-%m-%d").date()
     end_date = datetime.datetime.strptime(args.end_date, "%Y-%m-%d").date()
 
-    all_df = []
-    n_days = n_days_between(start_date, end_date)
-    day_gen = enumerate(generate_dates(start_date=start_date, end_date=end_date))
-    for i, date in tqdm(day_gen, total=n_days, desc="Scraping days"):
-        try:
-            all_df.append(get_articles(date))
-        except:
-            print(f"Error on date {date}")
-        # save every 50 days
-        if i % 20 == 0:
-            save(pd.concat(all_df), args.output)
-            print(f"Saved {i} days")
+    if args.mode == "collect":
+        print("Sammle Links …")
+        collect_links(start_date, end_date, args.links_file)
+        print(f"Links wurden inkrementell in {args.links_file} gespeichert.")
+    elif args.mode == "fetch":
+        print("Lade Links aus der Datei …")
+        entries = load_links(args.links_file)
+        print(f"{len(entries)} Links wurden geladen.")
+        print("Lade Artikel parallel mit asyncio …")
+        articles = asyncio.run(fetch_all_articles(entries))
+        save_articles(articles, args.output)
+        print(f"Artikel wurden in {args.output} gespeichert.")
 
-    save(pd.concat(all_df), args.output)
-    print(f"Done - saved to {args.output}")
+
+if __name__ == "__main__":
+    main()
