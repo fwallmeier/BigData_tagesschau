@@ -3,12 +3,17 @@ import asyncio
 import aiohttp
 import bs4
 import urllib.request
-import datetime
-import json
 import argparse
 import pandas as pd
+import threading
+import concurrent.futures
+import datetime
+import json
+
+from aiohttp import ClientResponseError
 from tqdm import tqdm
 import os
+
 
 
 def load_content(date, page=1):
@@ -62,6 +67,8 @@ def get_links_from_page(date, page):
         date_elem = child.find("div", class_="teaser-right__date")
         date_api = date_elem.get_text(strip=True) if date_elem else None
         links.append({
+            "date_api": date,
+            "page_api": page,
             "date": date_api if date_api else date,
             "headline": headline,
             "short_headline": short_headline,
@@ -71,67 +78,124 @@ def get_links_from_page(date, page):
     return links, monthly_summary
 
 
-import concurrent.futures
+# Gemeinsame Struktur, um verarbeitete Monate zu speichern.
+# Schlüssel: (Jahr, Monat), Wert: True, wenn ein Monats‑Summary bereits erkannt wurde.
+processed_months = {}
+processed_months_lock = threading.Lock()
+
+# Globaler Lock zum synchronen Schreiben in die Datei
+file_write_lock = threading.Lock()
+
+# Globale Liste und Lock zum Tracken der aktiven Monate
+active_months = []
+active_months_lock = threading.Lock()
+
+
+def process_month(year, month, days, links_filename, page = 1):
+    """
+    Verarbeitet alle Tage eines Monats sequentiell.
+    Sobald innerhalb eines Monats ein Monats‑Summary erkannt wird, werden die restlichen Tage übersprungen.
+    Zudem wird der aktuell verarbeitete Monat in der globalen Liste active_months geführt.
+    """
+    month_str = f"{month:02d}.{year}"
+    with active_months_lock:
+        active_months.append(month_str)
+
+    monthly_summary_detected = False
+    month_links = []
+
+    for day in days:
+        if monthly_summary_detected:
+            # Falls bereits ein Monats‑Summary gefunden wurde, werden die restlichen Tage übersprungen.
+            break
+
+        date_str = day.strftime("%Y-%m-%d")
+        daily_links = []
+
+        # Seiten des Tages sequentiell abarbeiten.
+        while True:
+            try:
+                links, monthly_summary = get_links_from_page(date_str, page)
+            except Exception as e:
+                print(f"Fehler bei {date_str} Seite {page}: {e}")
+                break
+
+            if not links:
+                break  # Keine weiteren Seiten vorhanden
+
+            daily_links.extend(links)
+
+            if monthly_summary:
+                monthly_summary_detected = True
+            page += 1
+
+        month_links.extend(daily_links)
+    # Inkremetelles Speichern der gefundenen Links
+    if month_links:
+        with file_write_lock:
+            with open(links_filename, "a", encoding="utf-8") as f:
+                for entry in month_links:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    # Monat als nicht mehr aktiv markieren
+    with active_months_lock:
+        active_months.remove(month_str)
+
+    return month_links
+
 
 def collect_links(start_date, end_date, links_filename):
-
     """
-    Sammelt für alle Tage im angegebenen Zeitraum die verfügbaren Artikel-Links.
-    Parallelisiert das Abrufen der Seiteninhalte für eine schnellere Verarbeitung.
+    Sammelt für alle Monate im angegebenen Zeitraum die verfügbaren Artikel-Links.
+    - Die Tage werden zunächst nach (Jahr, Monat) gruppiert.
+    - Für jeden Monat werden die Tage sequentiell abgearbeitet.
+    - Falls innerhalb eines Monats ein Monats‑Summary erkannt wird, wird der Rest des Monats übersprungen.
+    - Die Verarbeitung der Monate erfolgt parallel, und der Fortschritt (aktuelle aktive Monate)
+      wird mittels tqdm angezeigt.
     """
-    processed_months = set()  # Set (Jahr, Monat), um doppelte Monatsübersichten zu vermeiden
     all_links = []
+
+    # Gruppiere die Tage nach (Jahr, Monat)
+    month_groups = {}
     current_date = start_date
-    total_days = (end_date - start_date).days + 1
-    error_file = "error_day.json"
+    while current_date <= end_date:
+        ym = (current_date.year, current_date.month)
+        month_groups.setdefault(ym, []).append(current_date)
+        current_date += datetime.timedelta(days=1)
 
-    with tqdm(total=total_days, desc="Verarbeite Tage", unit="Tag") as pbar, concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    # Parallelverarbeitung der Monate (maximal 5 Threads, anpassbar)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = {}
+        for (year, month), days in month_groups.items():
+            futures[executor.submit(process_month, year, month, days, links_filename)] = f"{month:02d}.{year}"
 
-        while current_date <= end_date:
-            date_str = current_date.strftime("%Y-%m-%d")
-            year_month = (current_date.year, current_date.month)
-
-            if year_month in processed_months:
-                current_date += datetime.timedelta(days=1)
+        with tqdm(total=len(futures), desc="Verarbeite Monate", unit="Monat") as pbar:
+            for future in concurrent.futures.as_completed(futures):
+                all_links.extend(future.result())
+                # Fortschritt aktualisieren: Zeige die aktuell aktiven Monate an
+                with active_months_lock:
+                    pbar.set_postfix(active=active_months.copy())
                 pbar.update(1)
-                continue
-
-            futures[executor.submit(get_links_from_page, date_str, 1)] = (date_str, 1, year_month)
-            current_date += datetime.timedelta(days=1)
-
-        for future in concurrent.futures.as_completed(futures):
-            date_str, page, year_month = futures[future]
-            try:
-                links, monthly_summary = future.result()
-                if links:
-                    all_links.extend(links)
-                    with open(links_filename, "a", encoding="utf-8") as f:
-                        for entry in links:
-                            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                if monthly_summary:
-                    processed_months.add(year_month)
-            except Exception as e:
-                error_data = {"date": date_str, "page": page, "error": str(e)}
-                print(f"Fehler beim Verarbeiten von {date_str} Seite {page}: {e}")
-
-                # Fehler in JSON-Datei speichern
-                if os.path.exists(error_file):
-                    with open(error_file, "r+", encoding="utf-8") as f:
-                        try:
-                            errors = json.load(f)
-                        except json.JSONDecodeError:
-                            errors = []
-                        errors.append(error_data)
-                        f.seek(0)
-                        json.dump(errors, f, ensure_ascii=False, indent=2)
-                else:
-                    with open(error_file, "w", encoding="utf-8") as f:
-                        json.dump([error_data], f, ensure_ascii=False, indent=2)
-
-        pbar.update(1)
 
     return all_links
+
+def collect_links_with_error(links_file):
+    with open("error_days.txt", "r", encoding="utf-8") as f:
+        for l in f.readlines():
+            month_groups = {}
+            infos = l.split(";")
+            start_date = datetime.datetime.strptime(infos[0], "%Y-%m-%d").date()
+            current_date = start_date
+            while True:
+                ym = (current_date.year, current_date.month)
+                month_groups.setdefault(ym, []).append(current_date)
+                current_date += datetime.timedelta(days=1)
+                if current_date.month > start_date.month:
+                    break
+
+            for (year, month), days in month_groups.items():
+                process_month(year, month, days, links_file, page=int(infos[1]))
+
 
 
 async def fetch_article(session, entry):
@@ -164,6 +228,7 @@ async def fetch_article(session, entry):
                     elif data.get("@type") == "NewsArticle":
                         entry["articleBody"] = data.get("articleBody", "")
                         entry["datePublished"] = data.get("datePublished", "")
+                        entry["datePublished"] = data.get("dateModified", "")
                         entry["author"] = data.get("author", "")
                         entry["description"] = data.get("description", "")
                         entry["taglist"] = data.get("keywords", [])  # Falls `keywords` existiert, speichern
@@ -175,23 +240,51 @@ async def fetch_article(session, entry):
         print(f"Error fetching article {url}: {e}")
         entry["taglist"] = []
         entry["taglist"] = []
-        return entry
+        return None
 
 
+async def fetch_article_with_retry(session, entry, max_retries=5):
+    retries = 0
+    while retries < max_retries:
+        try:
+            result = await fetch_article(session, entry)
+            if not result:
+                raise Exception
+            return result
+        except Exception as e:
+            wait_time = 10 + 2 ** retries  # Exponentielles Backoff
+            print(f"Rate limit erreicht. Warte {wait_time} Sekunden...")
+            await asyncio.sleep(wait_time)
+            retries += 1
+    print("Maximale Anzahl an Wiederholungen erreicht, breche ab.")
+    return None
 
-async def fetch_all_articles(entries, concurrency=10):
+
+async def fetch_all_articles(entries, concurrency):
     """
     Führt den asynchronen Abruf aller Artikel-Bodies mit einer maximalen Parallelität (concurrency) durch.
+    Lädt jeweils 3000 Einträge, pausiert dann 20 Sekunden und nutzt eine neue ClientSession.
     """
     results = []
-    connector = aiohttp.TCPConnector(limit=concurrency)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [fetch_article(session, entry) for entry in entries]
-        for future in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Fetching articles"):
-            result = await future
-            results.append(result)
-    return results
+    batch_size = 3000
 
+    for i in range(0, len(entries), batch_size):
+        batch = entries[i:i + batch_size if i+batch_size < len(entries) else len(entries)-1]
+        connector = aiohttp.TCPConnector(limit=concurrency)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            tasks = [fetch_article_with_retry(session, entry) for entry in batch]
+            for future in tqdm(asyncio.as_completed(tasks), total=len(tasks),
+                               desc=f"Fetching batch {i // batch_size + 1}"):
+                result = await future
+                if not result:
+                    break
+                results.append(result)
+
+        if i + batch_size < len(entries):  # Nur pausieren, wenn noch weitere Batches zu verarbeiten sind
+            await asyncio.sleep(20)
+        save_articles(results, f"cache_{i}.csv")
+
+    return results
 
 def load_links(links_filename):
     """
@@ -217,6 +310,7 @@ def save_articles(articles, output_filename):
     """
     df = pd.DataFrame(articles)
     if output_filename.endswith(".csv"):
+        df = df.sort_values(by='date_api')
         df.to_csv(output_filename, sep="\t", index=False)
     else:
         df.to_pickle(output_filename)
@@ -225,8 +319,8 @@ def save_articles(articles, output_filename):
 
 def main():
     parser = argparse.ArgumentParser(description="Tagesschau Archiv Scraper")
-    parser.add_argument("--mode", type=str, choices=["collect", "fetch"], required=True,
-                        help="Modus: 'collect' sammelt Links, 'fetch' lädt Artikel-Bodies")
+    parser.add_argument("--mode", type=str, choices=["collect", "collect_after","fetch"], required=True,
+                        help="Modus: 'collect' sammelt Links, 'collect_after' sammelt fehlerhafter Links, 'fetch' lädt Artikel-Bodies")
     parser.add_argument("--start_date", type=str, default="2023-10-01", help="Startdatum im Format YYYY-MM-DD")
     parser.add_argument("--end_date", type=str, default=datetime.date.today().strftime("%Y-%m-%d"),
                         help="Enddatum im Format YYYY-MM-DD")
@@ -242,12 +336,18 @@ def main():
         print("Sammle Links …")
         collect_links(start_date, end_date, args.links_file)
         print(f"Links wurden inkrementell in {args.links_file} gespeichert.")
+    if args.mode =="collect_after":
+
+        print("Sammle Links …, die zuvor Fehlerhaft waren")
+        collect_links_with_error(args.links_file)
+        print(f"Links wurden inkrementell in {args.links_file} gespeichert.")
+
     elif args.mode == "fetch":
         print("Lade Links aus der Datei …")
         entries = load_links(args.links_file)
         print(f"{len(entries)} Links wurden geladen.")
         print("Lade Artikel parallel mit asyncio …")
-        articles = asyncio.run(fetch_all_articles(entries))
+        articles = asyncio.run(fetch_all_articles(entries, concurrency=40))
         save_articles(articles, args.output)
         print(f"Artikel wurden in {args.output} gespeichert.")
 
