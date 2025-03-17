@@ -7,6 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 
+## THIS README IS OUTDATED
 
 This repository contains the code for scraping every article
 from the Tagesschau.de archive. Find a deduplicated version of the dataset
