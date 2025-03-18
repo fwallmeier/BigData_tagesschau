@@ -3,6 +3,8 @@ import datetime
 import json
 
 
+#Calculate Polority and Remove unsued Columns for ACF and PAFC analysis
+
 def parse_json_and_compute_polarity(json_str: str) -> float:
     """
     Parses a JSON string like:
