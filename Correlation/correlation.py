@@ -1,3 +1,5 @@
+from typing import List, Union
+
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -86,129 +88,191 @@ def filter_by_category(
     return df[df[category_col] == category]
 
 
+import pandas as pd
+
 def aggregate_sentiment(
-        df: pd.DataFrame,
-        date_col: str,
-        sentiment_col: str,
-        agg_func: str = 'mean',
-        freq: str = 'D',
-        start_date: str = None,
-        end_date: str = None,
-        handle_missing: str = 'drop'
-) -> pd.DataFrame:
+    df: pd.DataFrame,
+    date_col: str,
+    sentiment_col: str | list,
+    agg_func: str = "mean",
+    freq: str = "D",
+    start_date: str = None,
+    end_date: str = None,
+    handle_missing: str = "fill"
+):
     """
-    Aggregates sentiment over a given frequency (day, week, month) using mean/median.
-    Optionally filters the time range and handles missing dates by forward fill or drop.
+    Aggregates sentiment values by time period (day, week, month).
 
     Parameters
     ----------
     df : pd.DataFrame
-        Input dataframe.
+        The input DataFrame containing date and sentiment columns.
     date_col : str
-        The name of the datetime column for resampling.
-    sentiment_col : str
-        The name of the sentiment score column to aggregate.
+        The column name containing the date.
+    sentiment_col : str or list
+        One or more sentiment columns to aggregate.
     agg_func : str, optional
-        'mean' or 'median'
+        The aggregation function ('mean' or 'median').
     freq : str, optional
-        Resample frequency, e.g., 'D' (day), 'W' (week), 'M' (month).
+        The frequency for aggregation ('D' for daily, 'W' for weekly, 'M' for monthly).
     start_date : str, optional
-        Start date (inclusive). e.g. '2010-01-01'
+        The start date for filtering (format: 'YYYY-MM-DD').
     end_date : str, optional
-        End date (inclusive). e.g. '2020-12-31'
+        The end date for filtering (format: 'YYYY-MM-DD').
     handle_missing : str, optional
-        How to handle missing dates.
-        'drop' removes them, 'ffill' forward fills them.
+        How to handle missing values: 'fill' (forward-fill), 'drop' (remove NaNs).
 
     Returns
     -------
     pd.DataFrame
-        A dataframe with datetime index and one column of aggregated sentiment.
+        Aggregated sentiment time series.
     """
-    # Filter date range if given
+
+    # Sicherstellen, dass sentiment_col eine Liste ist
+    if isinstance(sentiment_col, str):
+        sentiment_col = [sentiment_col]
+
+    # Datum filtern
     if start_date:
         df = df[df[date_col] >= start_date]
     if end_date:
         df = df[df[date_col] <= end_date]
 
-    # We only need the date and the sentiment column
-    df = df[[date_col, sentiment_col]].copy()
+    # Nur relevante Spalten kopieren
+    df = df[[date_col] + sentiment_col].copy()
 
-    # Convert sentiment column to numeric (in case it's parsed as string)
-    df[sentiment_col] = pd.to_numeric(df[sentiment_col], errors='coerce')
+    # Alle Sentiment-Spalten in numerische Werte umwandeln
+    for col in sentiment_col:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Drop rows where sentiment is NaN
-    df.dropna(subset=[sentiment_col], inplace=True)
+    # NaN-Werte entfernen
+    df.dropna(subset=sentiment_col, inplace=True)
 
-    # Set date column as index
+    # Datum als Index setzen
     df.set_index(date_col, inplace=True)
 
-    # Resample to the requested frequency
-    if agg_func == 'mean':
+    # Aggregation für alle Spalten durchführen
+    if agg_func == "mean":
         ts = df.resample(freq).mean()
-    elif agg_func == 'median':
+    elif agg_func == "median":
         ts = df.resample(freq).median()
     else:
         raise ValueError("agg_func must be either 'mean' or 'median'")
 
-    # If we want to ensure we have a complete date range from start to end:
+    # Falls gewünscht: Vollständige Zeitreihe mit NaN-Werten ergänzen
     if start_date and end_date:
-        # Build a date range index
         full_idx = pd.date_range(start=start_date, end=end_date, freq=freq)
         ts = ts.reindex(full_idx)
 
-    # Handle missing
-    if handle_missing == 'ffill':
-        ts = ts.fillna(method='ffill')
-    elif handle_missing == 'drop':
+    # Fehlende Werte behandeln
+    if handle_missing == "ffill":
+        ts = ts.fillna(method="ffill")
+    elif handle_missing == "drop":
         ts = ts.dropna()
 
-    # Rename the sentiment column to something standardized
-    ts.columns = [f"{sentiment_col}_{agg_func}"]
+    # Spaltennamen anpassen
+    ts.columns = [f"{col}_{agg_func}" for col in sentiment_col]
 
     return ts
 
 
+def plot_sentiment_trend(ts_sentiment: pd.DataFrame, title_prefix: str = ''):
+    """
+    Plots the sentiment polarity development over time.
+
+    Parameters
+    ----------
+    ts_sentiment : pd.DataFrame
+        Aggregated sentiment time series (date as index, sentiment as columns).
+    title_prefix : str, optional
+        A string prefix for the plot title.
+    """
+    plt.figure(figsize=(10, 5))
+
+    # Farben für unterschiedliche Spalten definieren
+    colors = ['b', 'r', 'g', 'c', 'm', 'y', 'k']
+
+    for i, col in enumerate(ts_sentiment.columns):
+        plt.plot(ts_sentiment.index, ts_sentiment[col],
+                 color=colors[i % len(colors)], label=col, linewidth=2)
+
+    plt.xlabel('Zeit')
+    plt.ylabel('Polarität')
+    plt.title(f"{title_prefix} Sentiment-Entwicklung über die Zeit")
+    plt.legend()
+    plt.grid(True)
+
+    plt.show()
+
+
 def plot_acf_and_pacf(
-        series: pd.Series,
+        series: pd.Series | pd.DataFrame | list[pd.Series],
         lags: int = 40,
         title_prefix: str = ''
 ):
     """
-    Plots ACF and PACF for a given time series.
+    Plots ACF and PACF for a given time series or multiple time series.
 
     Parameters
     ----------
-    series : pd.Series
-        The time series data.
+    series : pd.Series, pd.DataFrame, or list[pd.Series]
+        The time series data. Can be a single series or multiple.
     lags : int, optional
         Number of lags to display in the ACF/PACF plots.
     title_prefix : str, optional
         A string prefix to give context in plot titles.
     """
-    # Convert series to numpy array (dropping NaNs if any remain)
-    data = series.dropna().values
+    # Falls eine einzelne pd.Series übergeben wurde -> In Liste umwandeln
+    if isinstance(series, pd.Series):
+        series = [series]
 
-    # Compute ACF and PACF
-    acf_values = acf(data, nlags=lags)
-    pacf_values = pacf(data, nlags=lags)
-    print(acf_values)
-    print(pacf_values)
+    # Falls ein DataFrame übergeben wurde -> Liste von Spalten extrahieren
+    elif isinstance(series, pd.DataFrame):
+        series = [series[col] for col in series.columns]
 
-    # Plot ACF
+    colors = ['b', 'r', 'g', 'c', 'm', 'y', 'k']  # Farben für mehrere Serien
+    num_series = len(series)
+
+    acf_values_list = []
+    pacf_values_list = []
+    labels = []
+
+    # ACF & PACF für jede Serie berechnen
+    for idx, s in enumerate(series):
+        if not isinstance(s, pd.Series):  # Sicherstellen, dass s eine Serie ist
+            raise ValueError(f"Element {idx} in 'series' ist kein pd.Series, sondern {type(s)}")
+
+        data = s.dropna().values  # Fehlende Werte entfernen
+        acf_values_list.append(acf(data, nlags=lags))
+        pacf_values_list.append(pacf(data, nlags=lags))
+        labels.append(s.name if s.name else f"Serie {idx + 1}")  # Spaltennamen verwenden
+
+    # ACF-Plot
     plt.figure(figsize=(7, 4))
-    plt.stem(range(len(acf_values)), acf_values)
-    plt.xlabel('Lag')
-    plt.ylabel('ACF')
-    plt.title(f'{title_prefix} Autocorrelation (ACF)')
+    for i, (acf_values, label) in enumerate(zip(acf_values_list, labels)):
+        offset = (i - num_series / 2) * 0.2  # Versatz für bessere Sichtbarkeit
+        x_values = np.arange(len(acf_values)) + offset  # Offset in x-Werte einfügen
+        plt.stem(x_values, acf_values, linefmt=colors[i % len(colors)] + "-",
+                 markerfmt=colors[i % len(colors)] + "o", basefmt="k-", label=label)
+
+    plt.xlabel("Lag")
+    plt.ylabel("ACF")
+    plt.title(f"{title_prefix} Autocorrelation (ACF)")
+    plt.legend()
     plt.show()
 
-    # Plot PACF
+    # PACF-Plot
     plt.figure(figsize=(7, 4))
-    plt.stem(range(len(pacf_values)), pacf_values)
-    plt.xlabel('Lag')
-    plt.ylabel('PACF')
-    plt.title(f'{title_prefix} Partial Autocorrelation (PACF)')
+    for i, (pacf_values, label) in enumerate(zip(pacf_values_list, labels)):
+        offset = (i - num_series / 2) * 0.2  # Versatz für bessere Sichtbarkeit
+        x_values = np.arange(len(pacf_values)) + offset  # Offset in x-Werte einfügen
+        plt.stem(x_values, pacf_values, linefmt=colors[i % len(colors)] + "-",
+                 markerfmt=colors[i % len(colors)] + "o", basefmt="k-", label=label)
+
+    plt.xlabel("Lag")
+    plt.ylabel("PACF")
+    plt.title(f"{title_prefix} Partial Autocorrelation (PACF)")
+    plt.legend()
     plt.show()
 
 
@@ -217,6 +281,12 @@ if __name__ == "__main__":
 
     # Path to your CSV file
     CSV_PATH = "../TagesschauDaten/tagesschau_articles_sentiment_clear.csv"
+    agg_func = 'median'
+    start_date = '2006-01-01'
+    end_date = '2025-03-01'
+    freq = "M"
+    category_to_analyze = 'inland'  # e.g., 'inland', 'ausland', 'wirtschaft', 'other', or 'all'
+    sentiment_columns = ['articleBody_polarity', 'short_headline_polarity'] #short_headline_polarity, articleBody_polarity
 
     # 1. Load and preprocess data
     df = load_and_preprocess_data(
@@ -226,30 +296,27 @@ if __name__ == "__main__":
     )
 
     # 2. Filter by category (inland, ausland, wirtschaft, other, or 'all')
-    category_to_analyze = 'all'  # e.g., 'inland', 'ausland', 'wirtschaft', 'other', or 'all'
     df_filtered = filter_by_category(df, category=category_to_analyze)
 
-    # 3. Pick which sentiment column you want to analyze
-    #    (Replace with the column name that holds the numeric score you want)
-    sentiment_column = 'articleBody_polarity'
-
     # 4. Aggregate sentiment by day/week/month using mean/median
-    #    You can change freq to 'W' (weekly) or 'M' (monthly)
-    #    and agg_func to 'median' if desired.
     ts_sentiment = aggregate_sentiment(
         df_filtered,
         date_col='date',
-        sentiment_col=sentiment_column,
-        agg_func='mean',  # 'mean' or 'median'
-        freq='D',  # 'D', 'W', 'M'
-        start_date='2006-01-01',
-        end_date='2025-12-31',
-        handle_missing='fill'  # 'drop' or 'ffill'
+        sentiment_col=sentiment_columns,
+        agg_func=agg_func,  # 'mean' oder 'median'
+        freq=freq,  # 'D', 'W', 'M'
+        start_date=start_date,
+        end_date=end_date,
+        handle_missing='fill'  # 'drop' oder 'ffill'
     )
 
-    # 6. Perform and plot ACF and PACF
+    print(ts_sentiment.head(10))
+
+    # 6. Perform and plot ACF and PACF for multiple sentiment columns
     plot_acf_and_pacf(
-        series=ts_sentiment[sentiment_column + '_mean'],
-        lags=20,
-        title_prefix=f"{category_to_analyze.capitalize()} {sentiment_column} (Mean)"
+        series=ts_sentiment[[f"{col}_{agg_func}" for col in sentiment_columns]],  # Mehrere Zeitreihen
+        lags=53,
+        title_prefix=f"S: {start_date}, E: {end_date}, Freq: {freq} ({agg_func.capitalize()})"
     )
+
+    plot_sentiment_trend(ts_sentiment)
