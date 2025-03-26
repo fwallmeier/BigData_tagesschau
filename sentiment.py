@@ -3,9 +3,12 @@ from tqdm import tqdm
 import time
 import os
 import json
+import re
 
 FILEPATH = "tagesschau_articles.csv"
 OUTPUT_FILE = "tagesschau_articles_sentiment.csv"
+# Maximum tokens to process at once - BERT model has a limit of 256 tokens
+MAX_TOKENS = 200  # Setting slightly lower than 256 to account for special tokens
 
 def load_data():
     """Load data from CSV file."""
@@ -14,29 +17,112 @@ def load_data():
     print(f"Loaded {len(df)} articles.")
     return df
 
+def split_text(text, max_tokens=MAX_TOKENS):
+    """
+    Split text into chunks that don't exceed max_tokens.
+    Using a simple approximation: one word is roughly one token.
+    For more precise tokenization, you'd need a proper tokenizer.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return []
+    
+    # Simple tokenization by splitting on whitespace
+    words = text.split()
+    
+    # If text is shorter than max_tokens, return as is
+    if len(words) <= max_tokens:
+        return [text]
+    
+    # Split into chunks
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for word in words:
+        if current_length + 1 > max_tokens:
+            # Current chunk is full, add it to chunks and start a new one
+            chunks.append(" ".join(current_chunk))
+            current_chunk = [word]
+            current_length = 1
+        else:
+            # Add word to current chunk
+            current_chunk.append(word)
+            current_length += 1
+    
+    # Add the last chunk if it's not empty
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+    
+    return chunks
+
 def analyze_text(text, model):
     """Analyze a single text field."""
     if not isinstance(text, str) or not text.strip():
         return "neutral", {"positive": 0.0, "negative": 0.0, "neutral": 0.0}
     
-    try:
-        # The model expects a list of texts
-        classes, probabilities = model.predict_sentiment([text], output_probabilities=True)
-        
-        # Extract the first result since we only passed one text
-        sentiment_class = classes[0]
-        
-        # Extract and format the probabilities
-        # The format is [[['positive', 0.97], ['negative', 0.02], ['neutral', 0.01]]]
-        prob_dict = {}
-        for label_prob_pair in probabilities[0]:
-            label = label_prob_pair[0]
-            prob = float(label_prob_pair[1])  # Convert to Python float
-            prob_dict[label] = prob
+    # Split text if it's too long
+    chunks = split_text(text)
+    
+    # If no valid chunks, return neutral
+    if not chunks:
+        return "neutral", {"positive": 0.0, "negative": 0.0, "neutral": 0.0}
+    
+    # If only one chunk, process it normally
+    if len(chunks) == 1:
+        try:
+            # The model expects a list of texts
+            classes, probabilities = model.predict_sentiment([text], output_probabilities=True)
             
-        return sentiment_class, prob_dict
+            # Extract the first result since we only passed one text
+            sentiment_class = classes[0]
+            
+            # Extract and format the probabilities
+            prob_dict = {}
+            for label_prob_pair in probabilities[0]:
+                label = label_prob_pair[0]
+                prob = float(label_prob_pair[1])  # Convert to Python float
+                prob_dict[label] = prob
+                
+            return sentiment_class, prob_dict
+        
+        except Exception as e:
+            print(f"Error analyzing text: {str(e)[:100]}...")
+            return "neutral", {"positive": 0.0, "negative": 0.0, "neutral": 0.0}
+    
+    # Multiple chunks: analyze each and aggregate results
+    all_probs = {"positive": 0.0, "negative": 0.0, "neutral": 0.0}
+    chunk_count = 0
+    
+    try:
+        for chunk in chunks:
+            # Analyze this chunk
+            classes, probabilities = model.predict_sentiment([chunk], output_probabilities=True)
+            
+            # Accumulate probabilities
+            for label_prob_pair in probabilities[0]:
+                label = label_prob_pair[0]
+                prob = float(label_prob_pair[1])
+                all_probs[label] += prob
+                
+            chunk_count += 1
+            
+        # Average the probabilities
+        for label in all_probs:
+            all_probs[label] /= chunk_count
+            
+        # Normalize to ensure probabilities sum to 1.0
+        prob_sum = sum(all_probs.values())
+        if prob_sum > 0:  # Avoid division by zero
+            for label in all_probs:
+                all_probs[label] /= prob_sum
+            
+        # Determine the overall sentiment class
+        sentiment_class = max(all_probs, key=all_probs.get)
+            
+        return sentiment_class, all_probs
+    
     except Exception as e:
-        print(f"Error analyzing text: {str(e)[:100]}...")
+        print(f"Error analyzing chunked text: {str(e)[:100]}...")
         return "neutral", {"positive": 0.0, "negative": 0.0, "neutral": 0.0}
 
 def process_row(row, model):
